@@ -35,12 +35,22 @@
  *    be considered read-only.
  * 4. You should not create a task after `wait_for_all` unless you've fetched
  *    the results. This is because the response buffer might overflow.
+ * 5. The input parameter can only be as big as one void*. If you need to pass
+ *    bigger data structure or more parameters, you need to pass a pointer to
+ *    it/them.
  *
  *
  * ---- TODO ----
  * 1. The C++ version is a bit janky and doesn't work with objects that have
  *    a destructor.
+ * 2. I think we can omit the response buffer and just check the results
+ *    directly.
  */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 
 /// Will create the worker threads and setup the task, response, and result
 /// buffer.
@@ -64,16 +74,20 @@ int get_thread_count();
 
 /// Creates a task and puts it in the task buffer. The `arg` **must** be valid
 /// until the `TaskResult` is available.
-#define create_task_with_arg(function, return_type, arg)    task_executor_create_task_impl(function, sizeof(return_type), (void*)(uintptr_t) arg)
-#define create_task(function, return_type)                  task_executor_create_task_impl(function, sizeof(return_type), 0)
+#define create_task_with_arg(function, return_type, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), x); } while (0)
+#define create_task(function, return_type)                task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), 0)
+
+/// Sets the `result` if the task is done or panics. The `task_id` **must not**
+/// be used afterwards.
+#define get_task_result(task_id, result)   task_executor_get_task_result_impl(task_id, result, sizeof(*result))
 
 /// Sets the `result` if the task is done. Returns 0 if a task hasn't completed
 /// and 1 otherwise. If the function returns 1, then the `task_id` **must not**
 /// be used again.
-#define try_get_task_result(task_id, result)    task_executor_try_get_task_result_impl(task_id, result, sizeof(*result))
+#define try_get_task_result(task_id, result)   task_executor_try_get_task_result_impl(task_id, result, sizeof(*result))
 /// Same as `try_get_task_result` but waits and always returns a valid result.
 /// When the function returns , then the `task_id` **must not** be used again.
-#define wait_for_task_result(task_id, result)   task_executor_wait_for_task_result_impl(task_id, result, sizeof(result))
+#define wait_for_task_result(task_id, result)  task_executor_wait_for_task_result_impl(task_id, result, sizeof(result))
 
 
 /// The amount of threads to create as default.
@@ -81,10 +95,12 @@ int get_thread_count();
 #define DEFAULT_THREAD_COUNT 8
 #endif
 
-/// The maximum size a return value of a task can have. Will be 8 bytes smaller
-/// than the result buffer block, which must be a power of 2.
+/// The maximum size a return value of a task can have. Will be
+/// `TASK_EXECUTOR_RESULT_META_DATA_SIZE` bytes smaller than the result buffer
+/// block, which must be a power of 2. This is because metadata needs to be
+/// stored in the result buffer block.
 #ifndef MAX_RETURN_SIZE
-#define MAX_RETURN_SIZE 56
+#define MAX_RETURN_SIZE 48
 #endif
 
 /// The maximum amount of pending tasks.
@@ -138,6 +154,7 @@ struct return_type_erasure { char data[MAX_RETURN_SIZE]; };
 typedef struct return_type_erasure (*TaskFunction)(void*);
 
 #define TASK_WRAPPER(function, type)                                           \
+const int function ## _return_id = __COUNTER__;                                \
 struct return_type_erasure function ## _task_wrapper(__unused void* param)     \
 {                                                                              \
     type thing = function();                                                   \
@@ -148,9 +165,12 @@ struct return_type_erasure function ## _task_wrapper(__unused void* param)     \
 }
 
 #define TASK_WRAPPER_WITH_ARG(function, type, arg_type)                        \
+const int function ## _return_id = __COUNTER__;                                \
 struct return_type_erasure function ## _task_wrapper(void* param)              \
 {                                                                              \
-    type thing = function((arg_type) param);                                   \
+    arg_type p;                                                                \
+    memcpy(&p, &param, sizeof(p));                                             \
+    type thing = function(p);                                                  \
     STATIC_ASSERT(sizeof(thing) <= MAX_RETURN_SIZE, MAX_RETURN_SIZE_Too_small);\
     STATIC_ASSERT(sizeof(arg_type) <= sizeof(param),   Param_too_big);         \
     struct return_type_erasure result;                                         \
@@ -178,120 +198,124 @@ using std::atomic_int;
 
 #define pthread_assert(code) do { int pthread_result = code; if (pthread_result) { fprintf(stderr, "pthread failed with code %d\n", pthread_result); exit(pthread_result); } }  while (0)
 
-
-static atomic_int g_dropped_tasks     = ATOMIC_VAR_INIT(0);
-static atomic_int g_dropped_responses = ATOMIC_VAR_INIT(0);
-static atomic_int g_dropped_results   = ATOMIC_VAR_INIT(0);
+#define POWER_OF_TWO(x) (((x) & ((x) - 1)) == 0)
 
 
 // ---- CIRCULAR TASK BUFFER ----
-struct Task
+typedef struct 
 {
     TaskFunction function;
     void* arg;
     int   id;
+    int   return_id;
     int   return_size;
-};
+} Task;
 
-STATIC_ASSERT((MAX_PENDING_TASKS_COUNT & (MAX_PENDING_TASKS_COUNT - 1)) == 0, CIRCULAR_TASK_BUFFER_COUNT_Not_a_power_of_2);
-struct CircularTaskBuffer
+STATIC_ASSERT(POWER_OF_TWO(MAX_PENDING_TASKS_COUNT), CIRCULAR_TASK_BUFFER_COUNT_Not_a_power_of_2);
+/// A queue for the main thread to push Tasks on, and for the worker threads to
+/// pop tasks from.
+typedef struct
 {
-    struct Task array[MAX_PENDING_TASKS_COUNT];
-    int back;
-    int front;
-};
-void        circular_task_buffer_init(struct CircularTaskBuffer* circular_task_buffer);
-int         circular_task_buffer_is_empty(struct CircularTaskBuffer circular_task_buffer);
-void        circular_task_buffer_push(struct CircularTaskBuffer* circular_task_buffer, struct Task value);
-struct Task circular_task_buffer_pop(struct CircularTaskBuffer* circular_task_buffer);
+    Task array[MAX_PENDING_TASKS_COUNT];
+    int  back;
+    int  front;
+} CircularTaskBuffer;
+void  circular_task_buffer_init(CircularTaskBuffer* circular_task_buffer);
+int   circular_task_buffer_is_empty(CircularTaskBuffer circular_task_buffer);
+int   circular_task_buffer_push(CircularTaskBuffer* circular_task_buffer, Task value);
+Task  circular_task_buffer_pop(CircularTaskBuffer* circular_task_buffer);
 
-// ---- CIRCULAR RESULT BUFFER ----
-STATIC_ASSERT((MAX_PENDING_RESPONSES_COUNT & (MAX_PENDING_RESPONSES_COUNT - 1)) == 0, CIRCULAR_RESPONSE_BUFFER_COUNT_Not_a_power_of_2);
-struct CircularResponseBuffer
+
+// ---- CIRCULAR RESPONSE BUFFER ----
+STATIC_ASSERT(POWER_OF_TWO(MAX_PENDING_RESPONSES_COUNT), CIRCULAR_RESPONSE_BUFFER_COUNT_Not_a_power_of_2);
+/// A queue for the worker threads to push Responses on, and for the main thread
+/// to pop responses from. A response is just an index to the result buffer.
+typedef struct 
 {
     int array[MAX_PENDING_RESPONSES_COUNT];
     int back;
     int front;
-};
-void circular_response_buffer_init(struct CircularResponseBuffer* circular_response_buffer);
-int  circular_response_buffer_is_empty(struct CircularResponseBuffer circular_response_buffer);
-void circular_response_buffer_push(struct CircularResponseBuffer* circular_response_buffer, int id);
-int  circular_response_buffer_pop(struct CircularResponseBuffer* circular_response_buffer);
-
+} CircularResponseBuffer;
+void circular_response_buffer_init(CircularResponseBuffer* circular_response_buffer);
+int  circular_response_buffer_is_empty(CircularResponseBuffer circular_response_buffer);
+int  circular_response_buffer_push(CircularResponseBuffer* circular_response_buffer, int id);
+int  circular_response_buffer_pop(CircularResponseBuffer* circular_response_buffer);
 
 
 // ---- LINKED BLOCK LIST ----
-struct Block
+typedef struct 
 {
-    char raw[MAX_RETURN_SIZE+8];
-};
-STATIC_ASSERT(sizeof(struct Block) % 8 == 0, Block_Not_multiple_of_size_8);
+    char   raw[MAX_RETURN_SIZE];
+    size_t return_id;
+    size_t size;
+} Block;
+STATIC_ASSERT(sizeof(Block) % 8 == 0, Block_Not_multiple_of_size_8);
 STATIC_ASSERT(sizeof(size_t) == 8, size_t_of_unexpected_size);
-void   block_set_data(struct Block* block, char* data, size_t size);
-size_t block_data_size(const struct Block* block);
+void   block_set_data(Block* block, char* data, size_t size, int return_id);
+size_t block_data_size(const Block* block);
 
 union Node
 {
-    struct Block data;
-    union  Node* next;
+    Block data;
+
+    // This data is basically free as `Block` is big.
+    struct
+    {
+        union Node* next;
+        int has_been_freed;
+    } info;
 };
 
-STATIC_ASSERT((MAX_IDLE_RESULT_COUNT & (MAX_IDLE_RESULT_COUNT - 1)) == 0, LINKED_BLOCK_LIST_COUNT_Not_a_power_of_2);
-struct LinkedBlockList
+STATIC_ASSERT(POWER_OF_TWO(MAX_IDLE_RESULT_COUNT), LINKED_BLOCK_LIST_COUNT_Not_a_power_of_2);
+/// The result buffer. The main thread first allocates space and then sends the
+/// task for the workers to put the result into. The main thread will never
+/// write to it and only one worker will ever write to it.
+typedef struct 
 {
     union Node  data[MAX_IDLE_RESULT_COUNT];
     union Node* free;
-};
+} LinkedBlockList;
 
-void          linked_block_list_init(struct LinkedBlockList* list);
-int           linked_block_list_add(struct LinkedBlockList* list);
-struct Block* linked_block_list_get(struct LinkedBlockList* list, int id);
-void          linked_block_list_remove(struct LinkedBlockList* list, int id);
-
+void   linked_block_list_init(LinkedBlockList* list);
+int    linked_block_list_add(LinkedBlockList* list);
+Block* linked_block_list_get(LinkedBlockList* list, int index);
+void   linked_block_list_remove(LinkedBlockList* list, int index);
 
 
 // ---- CIRCULAR TASK BUFFER ----
-void circular_task_buffer_init(struct CircularTaskBuffer* circular_task_buffer)
+void circular_task_buffer_init(CircularTaskBuffer* circular_task_buffer)
 {
     circular_task_buffer->front = 0;
     circular_task_buffer->back  = 0;
 }
 
-int circular_task_buffer_is_empty(struct CircularTaskBuffer circular_task_buffer)
+int circular_task_buffer_is_empty(CircularTaskBuffer circular_task_buffer)
 {
     return circular_task_buffer.back == circular_task_buffer.front;
 }
 
-void circular_task_buffer_push(struct CircularTaskBuffer* circular_task_buffer, struct Task value)
+int circular_task_buffer_push(CircularTaskBuffer* circular_task_buffer, Task value)
 {
     int index = circular_task_buffer->front;
     int next  = (circular_task_buffer->front + 1) & (MAX_PENDING_RESPONSES_COUNT - 1);
 
     if (circular_task_buffer->back == next)
     {
-        #if TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
-            PANIC("Task buffer overflowed.\n");
-        #elif TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
-            TASK_EXECUTOR_LOGGER("Task buffer overflowed. Dropping task %d.\n", value.id);
-            atomic_fetch_add(&g_dropped_tasks, 1);  // TODO(ted): Does not need atomicity.
-        #else
-            #error "Invalid option for TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW"
-        #endif
-
-        return;
+        return 0;
     }
 
     circular_task_buffer->array[index] = value;
     circular_task_buffer->front = next;
 
     assert(0 <= circular_task_buffer->front && circular_task_buffer->front < MAX_PENDING_TASKS_COUNT && "Invalid implementation.");
+    return 1;
 }
 
-struct Task circular_task_buffer_pop(struct CircularTaskBuffer* circular_task_buffer)
+Task circular_task_buffer_pop(CircularTaskBuffer* circular_task_buffer)
 {
     assert(circular_task_buffer->front != circular_task_buffer->back && "Task buffer underflowed.");
 
-    struct Task result = circular_task_buffer->array[circular_task_buffer->back];
+    Task result = circular_task_buffer->array[circular_task_buffer->back];
     circular_task_buffer->back = (circular_task_buffer->back + 1) & (MAX_PENDING_TASKS_COUNT - 1);
 
     assert(0 <= circular_task_buffer->back && circular_task_buffer->back < MAX_PENDING_TASKS_COUNT && "Invalid implementation.");
@@ -300,43 +324,35 @@ struct Task circular_task_buffer_pop(struct CircularTaskBuffer* circular_task_bu
 
 
 // ---- CIRCULAR RESPONSE BUFFER ----
-void circular_response_buffer_init(struct CircularResponseBuffer* circular_response_buffer)
+void circular_response_buffer_init(CircularResponseBuffer* circular_response_buffer)
 {
     circular_response_buffer->front = 0;
     circular_response_buffer->back  = 0;
 }
 
-int circular_response_buffer_is_empty(struct CircularResponseBuffer circular_response_buffer)
+int circular_response_buffer_is_empty(CircularResponseBuffer circular_response_buffer)
 {
     return circular_response_buffer.back == circular_response_buffer.front;
 }
 
-void circular_response_buffer_push(struct CircularResponseBuffer* circular_response_buffer, int id)
+int circular_response_buffer_push(CircularResponseBuffer* circular_response_buffer, int id)
 {
     int index = circular_response_buffer->front;
     int next  = (circular_response_buffer->front + 1) & (MAX_PENDING_RESPONSES_COUNT - 1);
 
     if (circular_response_buffer->back == next)
     {
-        #if TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
-            PANIC("Response buffer overflowed.\n");
-        #elif TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
-            TASK_EXECUTOR_LOGGER("Response buffer overflowed. Dropping result %d.\n", id);
-            atomic_fetch_add(&g_dropped_responses, 1);
-        #else
-            #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
-        #endif
-
-        return;
+        return 0;
     }
 
     circular_response_buffer->array[index] = id;
     circular_response_buffer->front = next;
 
     assert(0 <= circular_response_buffer->front && circular_response_buffer->front < MAX_PENDING_RESPONSES_COUNT && "Invalid implementation");
+    return 1;
 }
 
-int circular_response_buffer_pop(struct CircularResponseBuffer* circular_response_buffer)
+int circular_response_buffer_pop(CircularResponseBuffer* circular_response_buffer)
 {
     assert(circular_response_buffer->front != circular_response_buffer->back && "Response buffer underflowed");
 
@@ -349,64 +365,69 @@ int circular_response_buffer_pop(struct CircularResponseBuffer* circular_respons
 
 
 // ---- LINKED BLOCK LIST ----
-void block_set_data(struct Block* block, char* data, size_t size)
+void block_set_data(Block* block, char* data, size_t size, int return_id)
 {
     assert(size <= MAX_RETURN_SIZE && "Too large size");
     assert(size != 0 && "Size cannot be 0");
     memcpy(block->raw, data, size);
-    size_t* meta_data = (size_t*) &block->raw[MAX_RETURN_SIZE];
-    *meta_data = size;
+
+    // NOTE(ted): Must be set in this order as we use `block->size` to check
+    //  whether the block is done writing.
+    block->return_id = return_id;
+    block->size      = size;
 }
 
-size_t block_data_size(const struct Block* block)
+size_t block_data_size(const Block* block)
 {
-    return *(size_t*) &block->raw[MAX_RETURN_SIZE];
+    return block->size;
 }
 
-void linked_block_list_init(struct LinkedBlockList* list)
+size_t block_return_id(const Block* block)
+{
+    return block->return_id;
+}
+
+void linked_block_list_init(LinkedBlockList* list)
 {
     for (int i = 0; i < MAX_IDLE_RESULT_COUNT - 1; ++i)
     {
-        union Node* node = &list->data[i];
-        union Node* next = &list->data[i+1];
-        node->next = next;
+        list->data[i].info.next = &list->data[i+1];
+        list->data[i].info.has_been_freed = 1;
     }
-    list->free = list->data;
+    list->data[MAX_IDLE_RESULT_COUNT - 1].info.has_been_freed = 1;
+    list->data[MAX_IDLE_RESULT_COUNT - 1].info.next = 0;
+    list->free = &list->data[0];
 }
 
-int linked_block_list_add(struct LinkedBlockList* list)
+int linked_block_list_add(LinkedBlockList* list)
 {
     if (!list->free)
     {
-        #if TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
-            PANIC("Result buffer overflowed.\n");
-        #elif TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
-            TASK_EXECUTOR_LOGGER("Result buffer overflowed. Dropping result.\n");
-            atomic_fetch_add(&g_dropped_results, 1);  // TODO(ted): Does not need atomicity.
-        #else
-            #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
-        #endif
         return -1;
     }
-    assert(list->data <= list->free && list->free < list->data + MAX_IDLE_RESULT_COUNT && "Invalid implementation");
 
-    int index  = (int) (list->free - list->data);
-    list->free = list->free->next;
+    assert(list->free->info.has_been_freed);
+    int index = (int) (list->free - list->data);
+    list->free->info.has_been_freed = 0;
+    list->free = list->free->info.next;
+
+    assert(list->free == 0 || list->data <= list->free && list->free < list->data + MAX_IDLE_RESULT_COUNT && "Invalid implementation");
 
     return index;
 }
 
-struct Block* linked_block_list_get(struct LinkedBlockList* list, int id)
+Block* linked_block_list_get(LinkedBlockList* list, int index)
 {
-    assert(0 <= id && id < MAX_IDLE_RESULT_COUNT && "Wrong id");
-    return &list->data[id].data;
+    assert(0 <= index && index < MAX_IDLE_RESULT_COUNT && "Wrong id");
+    return &list->data[index].data;
 }
 
-void linked_block_list_remove(struct LinkedBlockList* list, int id)
+void linked_block_list_remove(LinkedBlockList* list, int index)
 {
-    assert(0 <= id && id < MAX_IDLE_RESULT_COUNT && "Wrong id");
-    union Node* node = &list->data[id];
-    node->next = list->free;
+    assert(0 <= index && index < MAX_IDLE_RESULT_COUNT && "Wrong id");
+    union Node* node = &list->data[index];
+    node->info.has_been_freed = 1;
+    node->info.next = list->free;
     list->free = node;
     assert(list->data <= list->free && list->free < list->data + MAX_IDLE_RESULT_COUNT && "Invalid implementation");
 }
@@ -418,40 +439,97 @@ static pthread_cond_t  g_request_is_available_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_result_is_available_cond  = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_task_executor_terminated  = PTHREAD_COND_INITIALIZER;
 
+static int g_task_executor_has_terminated     = 0;
+static int g_task_executor_wants_to_terminate = 0;
 
-static int g_task_executor_has_terminated = 1;
-static atomic_int g_thread_count = ATOMIC_VAR_INIT(0);
+static atomic_int g_tasks_left    = ATOMIC_VAR_INIT(0);
+static atomic_int g_thread_count  = ATOMIC_VAR_INIT(0);
+static atomic_int g_dropped_tasks = ATOMIC_VAR_INIT(0);
 
-static struct CircularTaskBuffer     g_pending_requests  = {};
-static struct CircularResponseBuffer g_pending_responses = {};
-static struct LinkedBlockList        g_results           = {};
-
-
-#define NO_TASK_FOUND_ID    -1
-#define TERMINATION_TASK_ID -2
-#define EXHAUSTED_TASK_ID   -3
+static CircularTaskBuffer     g_pending_requests  = {};
+static CircularResponseBuffer g_pending_responses = {};
+static LinkedBlockList        g_results           = {};
 
 
+#define NO_TASK_FOUND_ID   -1
+#define EXHAUSTED_TASK_ID  -2
 
-int task_executor_create_task_impl(TaskFunction function, int return_size, void* arg)
+
+int task_executor_create_task_impl(TaskFunction function, int return_id, int return_size, void* arg)
 {
     assert(g_thread_count > 0 && "No threads have been created!");
-    assert(g_task_executor_has_terminated != 1 && "Task executor has been terminated!");
 
     int id;
     {
-        pthread_assert(pthread_mutex_lock(&g_lock));
+        // NOTE(ted): Doesn't need synchronization as there's never more than
+        //  one thread that'll read/write to the same data at the same time.
+        //  The operations on the exact data are separated in time.
+        //  1. The main thread allocates space and gets the id.
+        //  2. Then the worker thread copies data into the space at the id.
+        //  3. After that, the main thread copies out of the space and
+        //     deallocates it.
         id = linked_block_list_add(&g_results);
         if (id >= 0)
         {
-            struct Task task = { function, arg, id, return_size };
-            circular_task_buffer_push(&g_pending_requests, task);
+            Task task = { function, arg, id, return_id, return_size };
+
+            // NOTE(ted): I don't think this needs to be synchronized as
+            //  it's only the main thread that will call this. Any data race
+            //  will not result in bugs.
+            if (!circular_task_buffer_push(&g_pending_requests, task))
+            {
+                #if TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+                    PANIC("Task buffer overflowed.\n");
+                #elif TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+                    TASK_EXECUTOR_LOGGER("Can't allocate space in result buffer. Task not started...\n");
+                    atomic_fetch_add(&g_dropped_tasks, 1);
+                #else
+                    #error "Invalid option for TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW"
+                #endif
+            }
+            else
+            {
+                atomic_fetch_add(&g_tasks_left, 1);
+            }
         }
-        pthread_assert(pthread_mutex_unlock(&g_lock));
+        else
+        {
+            #if TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+                PANIC("Result buffer overflowed.\n");
+            #elif TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+                TASK_EXECUTOR_LOGGER("Can't allocate space in result buffer. Task not started...\n");
+                atomic_fetch_add(&g_dropped_tasks, 1);
+            #else
+                #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
+            #endif
+        }
     }
     pthread_assert(pthread_cond_signal(&g_request_is_available_cond));
 
     return id;
+}
+
+
+void task_executor_get_task_result_impl(int task_id, void* result, size_t return_size)
+{
+    assert(task_id >= 0 && "Invalid task!");
+
+    // NOTE(ted): No need to lock for the check as once the block has been
+    //  set it'll never be modified by another thread or change memory address.
+    //  Only the main thread will declare it as free.
+    Block* block = linked_block_list_get(&g_results, task_id);
+    assert(block_data_size(block) > 0);
+    memcpy(result, block, return_size);
+
+    // NOTE(ted): Doesn't need synchronization as there's never more than
+    //  one thread that'll read/write to the same data at the same time.
+    //  The operations on the exact data are separated in time.
+    //  1. The main thread allocates space and gets the id.
+    //  2. Then the worker thread copies data into the space at the id.
+    //  3. After that, the main thread copies out of the space and
+    //     deallocates it.
+    linked_block_list_remove(&g_results, task_id);
+    atomic_fetch_add(&g_tasks_left, -1);
 }
 
 
@@ -462,15 +540,20 @@ int task_executor_try_get_task_result_impl(int task_id, void* result, size_t ret
     // NOTE(ted): No need to lock for the check as once the block has been
     //  set it'll never be modified by another thread or change memory address.
     //  Only the main thread will declare it as free.
-    struct Block* block = linked_block_list_get(&g_results, task_id);
+    Block* block = linked_block_list_get(&g_results, task_id);
     if (block_data_size(block) > 0)
     {
         memcpy(result, block, return_size);
 
-        // NOTE(ted): Requires a lock as the function is not thread-safe.
-        pthread_assert(pthread_mutex_lock(&g_lock));
+        // NOTE(ted): Doesn't need synchronization as there's never more than
+        //  one thread that'll read/write to the same data at the same time.
+        //  The operations on the exact data are separated in time.
+        //  1. The main thread allocates space and gets the id.
+        //  2. Then the worker thread copies data into the space at the id.
+        //  3. After that, the main thread copies out of the space and
+        //     deallocates it.
         linked_block_list_remove(&g_results, task_id);
-        pthread_assert(pthread_mutex_unlock(&g_lock));
+        atomic_fetch_add(&g_tasks_left, -1);
         return 1;
     }
     return 0;
@@ -483,11 +566,17 @@ void task_executor_wait_for_task_result_impl(int task_id, void* result, size_t r
     // NOTE(ted): No need to lock for the check as once the block has been
     //  set it'll never be modified by another thread or change memory address.
     //  Only the main thread will declare it as free.
-    struct Block* block = linked_block_list_get(&g_results, task_id);
+    Block* block = linked_block_list_get(&g_results, task_id);
+
+    // NOTE(ted): Need to lock here as the main thread might enter the while
+    //  loop, and before attaining the lock another thread might write and
+    //  signal that a result is available, effectively making the main thread
+    //  miss the signal and wait. This results in a deadlock if no more
+    //  results are signaled to wake up the main thread.
+    pthread_assert(pthread_mutex_lock(&g_lock));
     while (block_data_size(block) > 0)
     {
         TASK_EXECUTOR_LOGGER("[Main]: No results... Waiting.\n");
-        pthread_assert(pthread_mutex_lock(&g_lock));
         pthread_assert(pthread_cond_wait(&g_result_is_available_cond, &g_lock));
         pthread_assert(pthread_mutex_unlock(&g_lock));
         block = linked_block_list_get(&g_results, task_id);
@@ -495,11 +584,15 @@ void task_executor_wait_for_task_result_impl(int task_id, void* result, size_t r
 
     memcpy(result, block, return_size);
 
-    // NOTE(ted): Need to lock as the function modifies values shared between
-    //  the threads.
-    pthread_assert(pthread_mutex_lock(&g_lock));
+    // NOTE(ted): Doesn't need synchronization as there's never more than
+    //  one thread that'll read/write to the same data at the same time.
+    //  The operations on the exact data are separated in time.
+    //  1. The main thread allocates space and gets the id.
+    //  2. Then the worker thread copies data into the space at the id.
+    //  3. After that, the main thread copies out of the space and
+    //     deallocates it.
     linked_block_list_remove(&g_results, task_id);
-    pthread_assert(pthread_mutex_unlock(&g_lock));
+    atomic_fetch_add(&g_tasks_left, -1);
 }
 
 
@@ -507,50 +600,73 @@ void* task_executor_worker_loop(void* param)
 {
     size_t id = (size_t) param;
     struct return_type_erasure value = {};
-    struct Task task;
+    Task task;
 
     while (1)
     {
+        if (g_task_executor_wants_to_terminate)
+            break;
+
         {
+            // NOTE(ted): Need to lock here as the worker thread might enter the
+            //  while loop, and before attaining the lock the main thread might
+            //  write and signal that a result is available, effectively making
+            //  the worker thread miss the signal and wait. This results in a
+            //  deadlock if no more requests are signaled to wake up the worker
+            //  thread.
             pthread_assert(pthread_mutex_lock(&g_lock));
-            while (circular_task_buffer_is_empty(g_pending_requests))
+            while (!g_task_executor_wants_to_terminate && circular_task_buffer_is_empty(g_pending_requests))
             {
                 TASK_EXECUTOR_LOGGER("[Thread %zu]: Waiting for requests...\n", id);
                 pthread_assert(pthread_cond_wait(&g_request_is_available_cond, &g_lock));
             }
+
+            if (g_task_executor_wants_to_terminate)
+            {
+                pthread_assert(pthread_mutex_unlock(&g_lock));
+                break;
+            }
+
+            // NOTE(ted): Need to lock as otherwise it would be read and written
+            //  to by multiple threads.
             task = circular_task_buffer_pop(&g_pending_requests);
-            TASK_EXECUTOR_LOGGER("[Thread %zu]: Got request %d\n", id, task.id);
             pthread_assert(pthread_mutex_unlock(&g_lock));
+            TASK_EXECUTOR_LOGGER("[Thread %zu]: Got request %d\n", id, task.id);
         }
 
-        if (task.id == TERMINATION_TASK_ID)
-        {
-            break;
-        }
-        else if (task.id == EXHAUSTED_TASK_ID)
-        {
-            TASK_EXECUTOR_LOGGER("[Thread %zu]: Got exhausted task.\n", id);
-            continue;
-        }
 
         assert(task.id >= 0 && task.function != 0 && "Invalid task!");
         value = task.function(task.arg);
 
-        {
-            // NOTE(ted): No need to block as the memory is exclusive to the
-            //  `id` and will not change or be modified until it's set.
-            struct Block* result = linked_block_list_get(&g_results, task.id);
-            block_set_data(result, value.data, task.return_size);
-        }
+        // NOTE(ted): No need to block as the memory is exclusive to the
+        //  `id` and will not change or be modified until it's set.
+        Block* result = linked_block_list_get(&g_results, task.id);
+        block_set_data(result, value.data, task.return_size, task.return_id);
 
         TASK_EXECUTOR_LOGGER("[Thread %zu]: Done with %d\n", id, task.id);
         {
+            // NOTE(ted): Need to lock as otherwise it would be read and written
+            //  to by multiple threads.
             pthread_assert(pthread_mutex_lock(&g_lock));
-            circular_response_buffer_push(&g_pending_responses, task.id);
-            pthread_assert(pthread_mutex_unlock(&g_lock));
-
-            // NOTE(ted): Should only exist one thread that receive results.
-            pthread_assert(pthread_cond_signal(&g_result_is_available_cond));
+            if (!circular_response_buffer_push(&g_pending_responses, task.id))
+            {
+                pthread_assert(pthread_mutex_unlock(&g_lock));
+                #if TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+                    PANIC("Response buffer overflowed.\n");
+                #elif TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+                    TASK_EXECUTOR_LOGGER("Can't allocate space in response buffer. Task %i dropped..\n", task.id);
+                    atomic_fetch_add(&g_dropped_tasks, 1);
+                    atomic_fetch_add(&g_tasks_left, -1);
+                #else
+                    #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
+                #endif
+            }
+            else
+            {
+                pthread_assert(pthread_mutex_unlock(&g_lock));
+                // NOTE(ted): Should only exist one thread that receive results.
+                pthread_assert(pthread_cond_signal(&g_result_is_available_cond));
+            }
         }
     }
 
@@ -600,10 +716,6 @@ int wait_for_one()
     // NOTE(ted): Should be thread-safe as only main will
     //  call pop which only modifies `head`. As only one
     //  thread will modify and read from it, it's safe.
-    //
-    //  One thread-safe problem is if `tail` and `head` point to
-    //  the same index but that's an invariant that always should
-    //  be held.
     int id = circular_response_buffer_pop(&g_pending_responses);
     TASK_EXECUTOR_LOGGER("[Main]: Got result %d\n", id);
     return id;
@@ -642,6 +754,26 @@ int poll_result()
 }
 
 
+int get_return_type(int task_id)
+{
+    if (task_id >= 0)
+    {
+        Block* block = linked_block_list_get(&g_results, task_id);
+        if (block_data_size(block) > 0)
+        {
+            return block_return_id(block);
+        }
+    }
+    return -1;
+}
+
+
+int tasks_in_progress()
+{
+    return g_tasks_left > 0;
+}
+
+
 void task_executor_initialize_with_thread_count(int thread_count)
 {
     assert(thread_count > 0 && "Can't create a task executor with less than 1 thread.");
@@ -649,8 +781,10 @@ void task_executor_initialize_with_thread_count(int thread_count)
 
     // NOTE(ted): Should be called from a single thread, so no atomic operations
     //  needed here.
+    g_task_executor_wants_to_terminate = 0;
     g_thread_count = thread_count;
     g_task_executor_has_terminated = 0;
+    g_tasks_left = 0;
 
     linked_block_list_init(&g_results);
     circular_task_buffer_init(&g_pending_requests);
@@ -665,6 +799,7 @@ void task_executor_initialize_with_thread_count(int thread_count)
     }
 }
 
+
 void task_executor_initialize()
 {
     task_executor_initialize_with_thread_count(DEFAULT_THREAD_COUNT);
@@ -673,29 +808,42 @@ void task_executor_initialize()
 
 void task_executor_terminate()
 {
-    TASK_EXECUTOR_LOGGER("[Main]: Sending termination requests\n");
+    assert(g_tasks_left == 0 && "Should not terminate with tasks left!\n");
+    TASK_EXECUTOR_LOGGER("[Main]: Sending termination request\n");
 
+    g_task_executor_wants_to_terminate = 1;
+
+    // NOTE(ted): Locking here just to make sure that the workers
+    //  were they checked the old value of `g_task_executor_wants_to_terminate`
+    //  but still haven't gotten to wait on `g_request_is_available_cond`.
+    //  Without the lock, they might miss the signal.
     pthread_assert(pthread_mutex_lock(&g_lock));
-    struct Task task = { 0, 0, TERMINATION_TASK_ID, 0 };
-    for (int i = 0; i < g_thread_count; ++i)  // TODO(ted): `thread_count` might need to be locked.
-    {
-        circular_task_buffer_push(&g_pending_requests, task);
-    }
     pthread_assert(pthread_mutex_unlock(&g_lock));
     pthread_assert(pthread_cond_broadcast(&g_request_is_available_cond));
 }
 
+
 void task_executor_terminate_and_wait()
 {
-    task_executor_terminate();
+    TASK_EXECUTOR_LOGGER("[Main]: Sending termination request and waiting on termination signal\n");
 
-    TASK_EXECUTOR_LOGGER("[Main]: Waiting on termination signal\n");
+    g_task_executor_wants_to_terminate = 1;
+
+    // NOTE(ted): Locking here just to make sure that the workers
+    //  were they checked the old value of `g_task_executor_wants_to_terminate`
+    //  but still haven't gotten to wait on `g_request_is_available_cond`.
+    //  Without the lock, they might miss the signal.
+    pthread_assert(pthread_mutex_lock(&g_lock));
+    pthread_assert(pthread_mutex_unlock(&g_lock));
+
+    pthread_assert(pthread_cond_broadcast(&g_request_is_available_cond));
+    pthread_assert(pthread_mutex_lock(&g_lock));
     while (!g_task_executor_has_terminated)
     {
-        pthread_assert(pthread_mutex_lock(&g_lock));
         pthread_assert(pthread_cond_wait(&g_task_executor_terminated, &g_lock));
-        pthread_assert(pthread_mutex_unlock(&g_lock));
     }
+    pthread_assert(pthread_mutex_unlock(&g_lock));
+
     TASK_EXECUTOR_LOGGER("[Main]: Task executor terminated\n");
 }
 
