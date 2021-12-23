@@ -77,6 +77,9 @@ int get_thread_count();
 #define create_task_with_arg(function, return_type, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), x); } while (0)
 #define create_task(function, return_type)                task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), 0)
 
+#define create_task_with_arg_no_return(function, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_impl(function ## _task_wrapper, 0, 0, x); } while (0)
+#define create_task_no_return(function)                task_executor_create_task_impl(function ## _task_wrapper, 0, 0, 0)
+
 /// Sets the `result` if the task is done or panics. The `task_id` **must not**
 /// be used afterwards.
 #define get_task_result(task_id, result)   task_executor_get_task_result_impl(task_id, result, sizeof(*result))
@@ -146,26 +149,36 @@ int get_thread_count();
 #endif
 
 
+#ifndef TASK_EXECUTOR_CACHE_LINE_SIZE
+#define TASK_EXECUTOR_CACHE_LINE_SIZE 64
+#endif
+
+
 #define STATIC_ASSERT(condition, message) typedef char static_assertion_##message[(condition) ? 1: -1]
 #define PANIC(message) do { fprintf(stderr, message); exit(-1); } while (0)
 
 
-struct return_type_erasure { char data[MAX_RETURN_SIZE]; };
+/// Generic holder of data.
+struct return_type_erasure
+{
+    char data[MAX_RETURN_SIZE];
+};
 typedef struct return_type_erasure (*TaskFunction)(void*);
 
 #define TASK_WRAPPER(function, type)                                           \
-const int function ## _return_id = __COUNTER__;                                \
-struct return_type_erasure function ## _task_wrapper(__unused void* param)     \
+const int function ## _return_id = UNIQUE_CONSTANT + 1;                        \
+struct return_type_erasure function ## _task_wrapper(void* param)              \
 {                                                                              \
+    (void*)param;                                                              \
     type thing = function();                                                   \
     STATIC_ASSERT(sizeof(thing) <= MAX_RETURN_SIZE, MAX_RETURN_SIZE_Too_small);\
-    struct return_type_erasure result;                                         \
+    struct return_type_erasure result = { 0 };                                 \
     memcpy(&result, &thing, sizeof(thing));                                    \
     return result;                                                             \
 }
 
 #define TASK_WRAPPER_WITH_ARG(function, type, arg_type)                        \
-const int function ## _return_id = __COUNTER__;                                \
+const int function ## _return_id = UNIQUE_CONSTANT + 1;                        \
 struct return_type_erasure function ## _task_wrapper(void* param)              \
 {                                                                              \
     arg_type p;                                                                \
@@ -173,8 +186,27 @@ struct return_type_erasure function ## _task_wrapper(void* param)              \
     type thing = function(p);                                                  \
     STATIC_ASSERT(sizeof(thing) <= MAX_RETURN_SIZE, MAX_RETURN_SIZE_Too_small);\
     STATIC_ASSERT(sizeof(arg_type) <= sizeof(param),   Param_too_big);         \
-    struct return_type_erasure result;                                         \
+    struct return_type_erasure result = { 0 };                                 \
     memcpy(&result, &thing, sizeof(thing));                                    \
+    return result;                                                             \
+}
+
+#define TASK_WRAPPER_NO_RETURN(function)                                       \
+struct return_type_erasure function ## _task_wrapper(void* param)              \
+{                                                                              \
+    (void*)param;                                                              \
+    function();                                                                \
+    struct return_type_erasure result = { 0 };                                 \
+    return result;                                                             \
+}
+
+#define TASK_WRAPPER_WITH_ARG_NO_RETURN(function, arg_type)                    \
+struct return_type_erasure function ## _task_wrapper(void* param)              \
+{                                                                              \
+    arg_type p;                                                                \
+    memcpy(&p, &param, sizeof(p));                                             \
+    function(p);                                                               \
+    struct return_type_erasure result = { 0 };                                 \
     return result;                                                             \
 }
 
@@ -198,7 +230,13 @@ using std::atomic_int;
 
 #define pthread_assert(code) do { int pthread_result = code; if (pthread_result) { fprintf(stderr, "pthread failed with code %d\n", pthread_result); exit(pthread_result); } }  while (0)
 
-#define POWER_OF_TWO(x) (((x) & ((x) - 1)) == 0)
+#define IS_POWER_OF_TWO(x) ((x) != 0 && ((x) & ((x) - 1)) == 0)
+#ifndef __COUNTER__
+#define UNIQUE_CONSTANT __LINE__
+#else
+#define UNIQUE_CONSTANT __COUNTER__
+#endif
+
 
 
 // ---- CIRCULAR TASK BUFFER ----
@@ -209,9 +247,9 @@ typedef struct
     int   id;
     int   return_id;
     int   return_size;
-} Task;
+} Task __attribute__ ((aligned(TASK_EXECUTOR_CACHE_LINE_SIZE)));
 
-STATIC_ASSERT(POWER_OF_TWO(MAX_PENDING_TASKS_COUNT), CIRCULAR_TASK_BUFFER_COUNT_Not_a_power_of_2);
+STATIC_ASSERT(IS_POWER_OF_TWO(MAX_PENDING_TASKS_COUNT), CIRCULAR_TASK_BUFFER_COUNT_Not_a_power_of_2);
 /// A queue for the main thread to push Tasks on, and for the worker threads to
 /// pop tasks from.
 typedef struct
@@ -227,7 +265,7 @@ Task  circular_task_buffer_pop(CircularTaskBuffer* circular_task_buffer);
 
 
 // ---- CIRCULAR RESPONSE BUFFER ----
-STATIC_ASSERT(POWER_OF_TWO(MAX_PENDING_RESPONSES_COUNT), CIRCULAR_RESPONSE_BUFFER_COUNT_Not_a_power_of_2);
+STATIC_ASSERT(IS_POWER_OF_TWO(MAX_PENDING_RESPONSES_COUNT), CIRCULAR_RESPONSE_BUFFER_COUNT_Not_a_power_of_2);
 /// A queue for the worker threads to push Responses on, and for the main thread
 /// to pop responses from. A response is just an index to the result buffer.
 typedef struct 
@@ -243,30 +281,27 @@ int  circular_response_buffer_pop(CircularResponseBuffer* circular_response_buff
 
 
 // ---- LINKED BLOCK LIST ----
-typedef struct 
+// NOTE(ted): This should be padded and aligned to each cache line to minimize
+//  false sharing.
+typedef struct
 {
     char   raw[MAX_RETURN_SIZE];
     size_t return_id;
     size_t size;
-} Block;
+} Block __attribute__ ((aligned(TASK_EXECUTOR_CACHE_LINE_SIZE)));
 STATIC_ASSERT(sizeof(Block) % 8 == 0, Block_Not_multiple_of_size_8);
 STATIC_ASSERT(sizeof(size_t) == 8, size_t_of_unexpected_size);
+STATIC_ASSERT(sizeof(Block) <= TASK_EXECUTOR_CACHE_LINE_SIZE, Block_too_big);  // TODO(ted): Might be a stupid restriction.
 void   block_set_data(Block* block, char* data, size_t size, int return_id);
 size_t block_data_size(const Block* block);
 
 union Node
 {
     Block data;
-
-    // This data is basically free as `Block` is big.
-    struct
-    {
-        union Node* next;
-        int has_been_freed;
-    } info;
+    union Node* next;
 };
 
-STATIC_ASSERT(POWER_OF_TWO(MAX_IDLE_RESULT_COUNT), LINKED_BLOCK_LIST_COUNT_Not_a_power_of_2);
+STATIC_ASSERT(IS_POWER_OF_TWO(MAX_IDLE_RESULT_COUNT), LINKED_BLOCK_LIST_COUNT_Not_a_power_of_2);
 /// The result buffer. The main thread first allocates space and then sends the
 /// task for the workers to put the result into. The main thread will never
 /// write to it and only one worker will ever write to it.
@@ -391,11 +426,9 @@ void linked_block_list_init(LinkedBlockList* list)
 {
     for (int i = 0; i < MAX_IDLE_RESULT_COUNT - 1; ++i)
     {
-        list->data[i].info.next = &list->data[i+1];
-        list->data[i].info.has_been_freed = 1;
+        list->data[i].next = &list->data[i+1];
     }
-    list->data[MAX_IDLE_RESULT_COUNT - 1].info.has_been_freed = 1;
-    list->data[MAX_IDLE_RESULT_COUNT - 1].info.next = 0;
+    list->data[MAX_IDLE_RESULT_COUNT - 1].next = 0;
     list->free = &list->data[0];
 }
 
@@ -406,10 +439,8 @@ int linked_block_list_add(LinkedBlockList* list)
         return -1;
     }
 
-    assert(list->free->info.has_been_freed);
     int index = (int) (list->free - list->data);
-    list->free->info.has_been_freed = 0;
-    list->free = list->free->info.next;
+    list->free = list->free->next;
 
     assert(list->free == 0 || list->data <= list->free && list->free < list->data + MAX_IDLE_RESULT_COUNT && "Invalid implementation");
 
@@ -426,14 +457,14 @@ void linked_block_list_remove(LinkedBlockList* list, int index)
 {
     assert(0 <= index && index < MAX_IDLE_RESULT_COUNT && "Wrong id");
     union Node* node = &list->data[index];
-    node->info.has_been_freed = 1;
-    node->info.next = list->free;
+    node->next = list->free;
     list->free = node;
     assert(list->data <= list->free && list->free < list->data + MAX_IDLE_RESULT_COUNT && "Invalid implementation");
 }
 
 
 // -------- TASK EXECUTOR --------
+// NOTE(ted): All these are shared between the threads.
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_request_is_available_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_result_is_available_cond  = PTHREAD_COND_INITIALIZER;
@@ -441,25 +472,34 @@ static pthread_cond_t  g_task_executor_terminated  = PTHREAD_COND_INITIALIZER;
 
 static int g_task_executor_has_terminated     = 0;
 static int g_task_executor_wants_to_terminate = 0;
+static int g_no_return_task_id = -3;
 
 static atomic_int g_tasks_left    = ATOMIC_VAR_INIT(0);
 static atomic_int g_thread_count  = ATOMIC_VAR_INIT(0);
 static atomic_int g_dropped_tasks = ATOMIC_VAR_INIT(0);
 
-static CircularTaskBuffer     g_pending_requests  = {};
-static CircularResponseBuffer g_pending_responses = {};
-static LinkedBlockList        g_results           = {};
+static CircularTaskBuffer     g_pending_requests  = { 0 };
+static CircularResponseBuffer g_pending_responses = { 0 };
+static LinkedBlockList        g_results           = { 0 };
 
 
-#define NO_TASK_FOUND_ID   -1
+#define NO_RETURN_ID        0
+#define INVALID_TASK_ID    -1
 #define EXHAUSTED_TASK_ID  -2
 
 
-int task_executor_create_task_impl(TaskFunction function, int return_id, int return_size, void* arg)
+static int task_executor_create_task_impl(TaskFunction function, int return_id, int return_size, void* arg)
 {
     assert(g_thread_count > 0 && "No threads have been created!");
 
     int id;
+    
+    if (return_size == 0)
+    {
+        id = g_no_return_task_id;
+        --g_no_return_task_id;
+    }
+    else
     {
         // NOTE(ted): Doesn't need synchronization as there's never more than
         //  one thread that'll read/write to the same data at the same time.
@@ -469,30 +509,7 @@ int task_executor_create_task_impl(TaskFunction function, int return_id, int ret
         //  3. After that, the main thread copies out of the space and
         //     deallocates it.
         id = linked_block_list_add(&g_results);
-        if (id >= 0)
-        {
-            Task task = { function, arg, id, return_id, return_size };
-
-            // NOTE(ted): I don't think this needs to be synchronized as
-            //  it's only the main thread that will call this. Any data race
-            //  will not result in bugs.
-            if (!circular_task_buffer_push(&g_pending_requests, task))
-            {
-                #if TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
-                    PANIC("Task buffer overflowed.\n");
-                #elif TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
-                    TASK_EXECUTOR_LOGGER("Can't allocate space in result buffer. Task not started...\n");
-                    atomic_fetch_add(&g_dropped_tasks, 1);
-                #else
-                    #error "Invalid option for TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW"
-                #endif
-            }
-            else
-            {
-                atomic_fetch_add(&g_tasks_left, 1);
-            }
-        }
-        else
+        if (id < 0)
         {
             #if TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
                 PANIC("Result buffer overflowed.\n");
@@ -502,15 +519,37 @@ int task_executor_create_task_impl(TaskFunction function, int return_id, int ret
             #else
                 #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
             #endif
+            return INVALID_TASK_ID;
         }
     }
-    pthread_assert(pthread_cond_signal(&g_request_is_available_cond));
+    
+    Task task = { function, arg, id, return_id, return_size };
+
+    // NOTE(ted): I don't think this needs to be synchronized as
+    //  it's only the main thread that will call this. Any data race
+    //  will not result in bugs.
+    if (!circular_task_buffer_push(&g_pending_requests, task))
+    {
+        #if TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+            PANIC("Task buffer overflowed.\n");
+        #elif TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+            TASK_EXECUTOR_LOGGER("Can't allocate space in task buffer. Task not started...\n");
+            atomic_fetch_add(&g_dropped_tasks, 1);
+        #else
+            #error "Invalid option for TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW"
+        #endif
+    }
+    else
+    {
+        pthread_assert(pthread_cond_signal(&g_request_is_available_cond));
+        atomic_fetch_add(&g_tasks_left, 1);
+    }
 
     return id;
 }
 
 
-void task_executor_get_task_result_impl(int task_id, void* result, size_t return_size)
+static void task_executor_get_task_result_impl(int task_id, void* result, size_t return_size)
 {
     assert(task_id >= 0 && "Invalid task!");
 
@@ -560,7 +599,6 @@ int task_executor_try_get_task_result_impl(int task_id, void* result, size_t ret
 }
 
 
-
 void task_executor_wait_for_task_result_impl(int task_id, void* result, size_t return_size)
 {
     // NOTE(ted): No need to lock for the check as once the block has been
@@ -599,7 +637,7 @@ void task_executor_wait_for_task_result_impl(int task_id, void* result, size_t r
 void* task_executor_worker_loop(void* param)
 {
     size_t id = (size_t) param;
-    struct return_type_erasure value = {};
+    struct return_type_erasure value = { 0 };
     Task task;
 
     while (1)
@@ -635,13 +673,16 @@ void* task_executor_worker_loop(void* param)
         }
 
 
-        assert(task.id >= 0 && task.function != 0 && "Invalid task!");
+        assert(task.id != EXHAUSTED_TASK_ID && task.id != INVALID_TASK_ID && task.function != 0 && "Invalid task!");
         value = task.function(task.arg);
 
-        // NOTE(ted): No need to block as the memory is exclusive to the
-        //  `id` and will not change or be modified until it's set.
-        Block* result = linked_block_list_get(&g_results, task.id);
-        block_set_data(result, value.data, task.return_size, task.return_id);
+        if (task.id >= 0)
+        {
+            // NOTE(ted): No need to block as the memory is exclusive to the
+            //  `id` and will not change or be modified until it's set.
+            Block* result = linked_block_list_get(&g_results, task.id);
+            block_set_data(result, value.data, task.return_size, task.return_id);
+        }
 
         TASK_EXECUTOR_LOGGER("[Thread %zu]: Done with %d\n", id, task.id);
         {
@@ -718,6 +759,12 @@ int wait_for_one()
     //  thread will modify and read from it, it's safe.
     int id = circular_response_buffer_pop(&g_pending_responses);
     TASK_EXECUTOR_LOGGER("[Main]: Got result %d\n", id);
+
+    if (id <= -3)
+    {
+        atomic_fetch_add(&g_tasks_left, -1);
+    }
+
     return id;
 }
 
@@ -732,6 +779,12 @@ void wait_for_all(const int* task_id_array, int count)
             if (task_id_array[i] == id)
             {
                 fetched += 1;
+
+                if (id <= -3)
+                {
+                    atomic_fetch_add(&g_tasks_left, -1);
+                }
+
                 break;
             }
         }
@@ -745,12 +798,21 @@ int poll_result()
     //  can be empty is after a pop, which only the main thread will
     //  perform, or before any push has been done.
     if (!circular_response_buffer_is_empty(g_pending_responses))
+    {
         // NOTE(ted): Should be thread-safe as only main will
         //  call pop which only modifies `head`. As only one
         //  thread will modify and read from it, it's safe.
-        return circular_response_buffer_pop(&g_pending_responses);
+        int id = circular_response_buffer_pop(&g_pending_responses);
+        if (id <= -3)
+        {
+            atomic_fetch_add(&g_tasks_left, -1);
+        }
+        return id;
+    }
     else
-        return NO_TASK_FOUND_ID;
+    {
+        return INVALID_TASK_ID;
+    }
 }
 
 
@@ -764,6 +826,11 @@ int get_return_type(int task_id)
             return block_return_id(block);
         }
     }
+    else if (task_id <= -3)
+    {
+        return 0;
+    }
+
     return -1;
 }
 
@@ -781,10 +848,13 @@ void task_executor_initialize_with_thread_count(int thread_count)
 
     // NOTE(ted): Should be called from a single thread, so no atomic operations
     //  needed here.
+    g_task_executor_has_terminated     = 0;
     g_task_executor_wants_to_terminate = 0;
-    g_thread_count = thread_count;
-    g_task_executor_has_terminated = 0;
-    g_tasks_left = 0;
+    g_no_return_task_id = -3;
+
+    g_tasks_left    = ATOMIC_VAR_INIT(0);
+    g_thread_count  = ATOMIC_VAR_INIT(thread_count);
+    g_dropped_tasks = ATOMIC_VAR_INIT(0);
 
     linked_block_list_init(&g_results);
     circular_task_buffer_init(&g_pending_requests);

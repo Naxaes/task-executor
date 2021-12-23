@@ -1,7 +1,7 @@
 #define TASK_EXECUTOR_IMPLEMENTATION
 #define TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW   TASK_EXECUTOR_DROP
 #define TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW TASK_EXECUTOR_DROP
-//#define TASK_EXECUTOR_LOGGER(...)
+#define TASK_EXECUTOR_LOGGER(...)
 #define MAX_RETURN_SIZE 24
 #include "task_executor.h"
 
@@ -61,10 +61,10 @@ double varying_task_other_float(double number)
 
 
 
-TASK_WRAPPER(heavy_task, struct MyThing);
-TASK_WRAPPER_WITH_ARG(varying_task, struct MyThing, int);
-TASK_WRAPPER_WITH_ARG(varying_task_other, int, int);
-TASK_WRAPPER_WITH_ARG(varying_task_other_float, double, double);
+TASK_WRAPPER(heavy_task, struct MyThing)
+TASK_WRAPPER_WITH_ARG(varying_task, struct MyThing, int)
+TASK_WRAPPER_WITH_ARG(varying_task_other, int, int)
+TASK_WRAPPER_WITH_ARG(varying_task_other_float, double, double)
 
 
 void test_executing_tasks()
@@ -197,32 +197,32 @@ void test_executing_and_requesting_tasks_interleaved_with_multiple_types()
         int task = poll_result();
         if (task >= 0)
         {
-            switch (get_return_type(task))
+            int return_id = get_return_type(task);
             {
-                case varying_task_return_id:
+                if (return_id == varying_task_return_id)
                 {
                     struct MyThing result;
-                    assert(try_get_task_result(task, &result));
+                    get_task_result(task, &result);
                     assert(result.data[0] == 2 && result.data[127] == 3);
                     free(result.data);
-                } break;
-                case varying_task_other_return_id:
+                }
+                else if (return_id == varying_task_other_return_id)
                 {
                     int result;
-                    assert(try_get_task_result(task, &result));
+                    get_task_result(task, &result);
                     assert(result == 45);
-                } break;
-                case varying_task_other_float_return_id:
+                }
+                else if (return_id == varying_task_other_float_return_id)
                 {
                     double result;
-                    assert(try_get_task_result(task, &result));
+                    get_task_result(task, &result);
                     double expected = 10.0 * 42.0 * 42.0;
                     assert(-0.001 <= expected - result && expected - result <= 0.001);
-                } break;
-                default:
+                }
+                else
                 {
                     assert(0);
-                } break;
+                }
             }
             results += 1;
         }
@@ -248,40 +248,41 @@ void test_executing_and_requesting_tasks_interleaved_with_multiple_types()
 }
 
 
-void temp()
+void test_better_interface()
 {
-    task_executor_initialize_with_thread_count(4);
+    task_executor_initialize_with_thread_count(8);
 
-    int queries = 0;
-    while (queries < 10000 || tasks_in_progress())
+    const size_t task_to_execute = 1000;
+    size_t queries = 0;
+    while (queries < task_to_execute || tasks_in_progress())
     {
         int task = poll_result();
-        switch (get_return_type(task))
+        int return_id = get_return_type(task);
         {
-            case varying_task_return_id:
+            if (return_id == varying_task_return_id)
             {
                 struct MyThing result;
                 get_task_result(task, &result);
                 assert(result.data[0] == 2 && result.data[127] == 3);
                 free(result.data);
-            } break;
-            case varying_task_other_return_id:
+            }
+            else if (return_id == varying_task_other_return_id)
             {
                 int result;
                 get_task_result(task, &result);
                 assert(result == 45);
-            } break;
-            case varying_task_other_float_return_id:
+            }
+            else if (return_id == varying_task_other_float_return_id)
             {
                 double result;
                 get_task_result(task, &result);
                 double expected = 10.0 * 42.0 * 42.0;
                 assert(-0.001 <= expected - result && expected - result <= 0.001);
-            } break;
-            default:
+            }
+            else
             {
-                if (queries > 10000)
-                    continue;
+                if (queries >= task_to_execute)
+                    break;
 
                 int a = 128;
                 int b = 10;
@@ -295,8 +296,15 @@ void temp()
                     create_task_with_arg(varying_task_other_float, double, c);
 
                 queries += 1;
-            } break;
+            }
         }
+    }
+
+    while (tasks_in_progress())
+    {
+        char result[255] = { 0 };
+        int task = wait_for_one();
+        get_task_result(task, &result);
     }
 
     assert(g_tasks_left == 0);
@@ -304,11 +312,64 @@ void temp()
 }
 
 
-int main()
+#include <unistd.h>
+#include <time.h>
+#include <stdlib.h>
+void random_task()
+{
+    int micro_seconds = rand() % 1000000;
+    printf("Sleeping for %d micro seconds\n", micro_seconds);
+    usleep(micro_seconds);
+}
+
+TASK_WRAPPER_NO_RETURN(random_task)
+
+void test_executing_tasks_of_random_time()
+{
+    srand(time(NULL));
+    task_executor_initialize_with_thread_count(4);
+
+    int results = 0;
+    int queries = 0;
+    const int task_to_execute = 10000;
+    while (queries < task_to_execute || tasks_in_progress())
+    {
+        int task = poll_result();
+        int return_id = get_return_type(task);
+        {
+            if (return_id == NO_RETURN_ID)
+            {
+                results += 1;
+            }
+            else
+            {
+                if (queries >= task_to_execute)
+                    break;
+
+                create_task_no_return(random_task);
+
+                queries += 1;
+            }
+        }
+    }
+
+    while (tasks_in_progress())
+    {
+        wait_for_one();
+        results += 1;
+    }
+
+    assert(results == task_to_execute - g_dropped_tasks);
+    task_executor_terminate_and_wait();
+}
+
+
+int main(int argc, const char* argv[])
 {
     test_executing_tasks();
     test_poll_tasks();
     test_executing_and_requesting_tasks_interleaved();
     test_executing_and_requesting_tasks_interleaved_with_multiple_types();
-    temp();
+    test_better_interface();
+    test_executing_tasks_of_random_time();
 }
