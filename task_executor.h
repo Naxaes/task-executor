@@ -77,8 +77,8 @@ int get_thread_count();
 #define create_task_with_arg(function, return_type, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), x); } while (0)
 #define create_task(function, return_type)                task_executor_create_task_impl(function ## _task_wrapper, function ## _return_id, sizeof(return_type), 0)
 
-#define create_task_with_arg_no_return(function, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_impl(function ## _task_wrapper, 0, 0, x); } while (0)
-#define create_task_no_return(function)                task_executor_create_task_impl(function ## _task_wrapper, 0, 0, 0)
+#define create_task_with_arg_no_return(function, arg)  do { void* x; memcpy(&x, &arg, sizeof(x)); task_executor_create_task_without_return_impl(function ## _task_wrapper, x); } while (0)
+#define create_task_no_return(function)                task_executor_create_task_without_return_impl(function ## _task_wrapper, 0)
 
 /// Sets the `result` if the task is done or panics. The `task_id` **must not**
 /// be used afterwards.
@@ -209,7 +209,6 @@ struct return_type_erasure function ## _task_wrapper(void* param)              \
     struct return_type_erasure result = { 0 };                                 \
     return result;                                                             \
 }
-
 
 
 
@@ -464,6 +463,12 @@ void linked_block_list_remove(LinkedBlockList* list, int index)
 
 
 // -------- TASK EXECUTOR --------
+#define NO_RETURN_ID        0
+#define TASK_ID_INVALID    -1
+#define TASK_ID_EXHAUSTED  -2
+#define TASK_ID_NO_RETURN_START_ID -3
+
+
 // NOTE(ted): All these are shared between the threads.
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_request_is_available_cond = PTHREAD_COND_INITIALIZER;
@@ -472,7 +477,7 @@ static pthread_cond_t  g_task_executor_terminated  = PTHREAD_COND_INITIALIZER;
 
 static int g_task_executor_has_terminated     = 0;
 static int g_task_executor_wants_to_terminate = 0;
-static int g_no_return_task_id = -3;
+static int g_no_return_task_id                = TASK_ID_NO_RETURN_START_ID;
 
 static atomic_int g_tasks_left    = ATOMIC_VAR_INIT(0);
 static atomic_int g_thread_count  = ATOMIC_VAR_INIT(0);
@@ -483,44 +488,64 @@ static CircularResponseBuffer g_pending_responses = { 0 };
 static LinkedBlockList        g_results           = { 0 };
 
 
-#define NO_RETURN_ID        0
-#define INVALID_TASK_ID    -1
-#define EXHAUSTED_TASK_ID  -2
+static int task_executor_create_task_without_return_impl(TaskFunction function, void* arg)
+{
+    assert(g_thread_count > 0 && "No threads have been created!");
+
+    int id = g_no_return_task_id;
+    g_no_return_task_id -= 1;
+
+    Task task = { function, arg, id, NO_RETURN_ID, 0 };
+
+    // NOTE(ted): I don't think this needs to be synchronized as
+    //  it's only the main thread that will call this. Any data race
+    //  will not result in bugs.
+    if (!circular_task_buffer_push(&g_pending_requests, task))
+    {
+        #if TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+            PANIC("Task buffer overflowed.\n");
+        #elif TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+            TASK_EXECUTOR_LOGGER("Can't allocate space in task buffer. Task not started...\n");
+            atomic_fetch_add(&g_dropped_tasks, 1);
+        #else
+            #error "Invalid option for TASK_EXECUTOR_ON_TASK_BUFFER_OVERFLOW"
+        #endif
+    }
+    else
+    {
+        pthread_assert(pthread_cond_signal(&g_request_is_available_cond));
+        atomic_fetch_add(&g_tasks_left, 1);
+    }
+
+    return id;
+}
 
 
 static int task_executor_create_task_impl(TaskFunction function, int return_id, int return_size, void* arg)
 {
     assert(g_thread_count > 0 && "No threads have been created!");
+    assert(return_size > 0 && "Return was unexpectedly 0.");
+    assert(return_id != NO_RETURN_ID && "Return id is wrong.");
 
-    int id;
-    
-    if (return_size == 0)
+    // NOTE(ted): Doesn't need synchronization as there's never more than
+    //  one thread that'll read/write to the same data at the same time.
+    //  The operations on the exact data are separated in time.
+    //  1. The main thread allocates space and gets the id.
+    //  2. Then the worker thread copies data into the space at the id.
+    //  3. After that, the main thread copies out of the space and
+    //     deallocates it.
+    int id = linked_block_list_add(&g_results);
+    if (id < 0)
     {
-        id = g_no_return_task_id;
-        --g_no_return_task_id;
-    }
-    else
-    {
-        // NOTE(ted): Doesn't need synchronization as there's never more than
-        //  one thread that'll read/write to the same data at the same time.
-        //  The operations on the exact data are separated in time.
-        //  1. The main thread allocates space and gets the id.
-        //  2. Then the worker thread copies data into the space at the id.
-        //  3. After that, the main thread copies out of the space and
-        //     deallocates it.
-        id = linked_block_list_add(&g_results);
-        if (id < 0)
-        {
-            #if TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
-                PANIC("Result buffer overflowed.\n");
-            #elif TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
-                TASK_EXECUTOR_LOGGER("Can't allocate space in result buffer. Task not started...\n");
-                atomic_fetch_add(&g_dropped_tasks, 1);
-            #else
-                #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
-            #endif
-            return INVALID_TASK_ID;
-        }
+        #if TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_PANIC
+            PANIC("Result buffer overflowed.\n");
+        #elif TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW == TASK_EXECUTOR_DROP
+            TASK_EXECUTOR_LOGGER("Can't allocate space in result buffer. Task not started...\n");
+            atomic_fetch_add(&g_dropped_tasks, 1);
+        #else
+            #error "Invalid option for TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW"
+        #endif
+        return TASK_ID_INVALID;
     }
     
     Task task = { function, arg, id, return_id, return_size };
@@ -673,7 +698,7 @@ void* task_executor_worker_loop(void* param)
         }
 
 
-        assert(task.id != EXHAUSTED_TASK_ID && task.id != INVALID_TASK_ID && task.function != 0 && "Invalid task!");
+        assert(task.id != TASK_ID_EXHAUSTED && task.id != TASK_ID_INVALID && task.function != 0 && "Invalid task!");
         value = task.function(task.arg);
 
         if (task.id >= 0)
@@ -760,7 +785,7 @@ int wait_for_one()
     int id = circular_response_buffer_pop(&g_pending_responses);
     TASK_EXECUTOR_LOGGER("[Main]: Got result %d\n", id);
 
-    if (id <= -3)
+    if (id <= TASK_ID_NO_RETURN_START_ID)
     {
         atomic_fetch_add(&g_tasks_left, -1);
     }
@@ -780,7 +805,7 @@ void wait_for_all(const int* task_id_array, int count)
             {
                 fetched += 1;
 
-                if (id <= -3)
+                if (id <= TASK_ID_NO_RETURN_START_ID)
                 {
                     atomic_fetch_add(&g_tasks_left, -1);
                 }
@@ -803,7 +828,7 @@ int poll_result()
         //  call pop which only modifies `head`. As only one
         //  thread will modify and read from it, it's safe.
         int id = circular_response_buffer_pop(&g_pending_responses);
-        if (id <= -3)
+        if (id <= TASK_ID_NO_RETURN_START_ID)
         {
             atomic_fetch_add(&g_tasks_left, -1);
         }
@@ -811,7 +836,7 @@ int poll_result()
     }
     else
     {
-        return INVALID_TASK_ID;
+        return TASK_ID_INVALID;
     }
 }
 
@@ -826,7 +851,7 @@ int get_return_type(int task_id)
             return block_return_id(block);
         }
     }
-    else if (task_id <= -3)
+    else if (task_id <= TASK_ID_NO_RETURN_START_ID)
     {
         return 0;
     }
@@ -850,7 +875,7 @@ void task_executor_initialize_with_thread_count(int thread_count)
     //  needed here.
     g_task_executor_has_terminated     = 0;
     g_task_executor_wants_to_terminate = 0;
-    g_no_return_task_id = -3;
+    g_no_return_task_id = TASK_ID_NO_RETURN_START_ID;
 
     g_tasks_left    = ATOMIC_VAR_INIT(0);
     g_thread_count  = ATOMIC_VAR_INIT(thread_count);
@@ -996,14 +1021,14 @@ template <class T>
 class task_result
 {
 public:
-    explicit task_result() : id(EXHAUSTED_TASK_ID) {  }
+    explicit task_result() : id(TASK_ID_EXHAUSTED) {  }
     explicit task_result(int id) : id(id) {  }
 
     option<T> try_get()
     {
         T result { };
         bool valid = task_executor_try_get_task_result_impl(id, &result, sizeof(T));
-        if (valid) id = EXHAUSTED_TASK_ID;
+        if (valid) id = TASK_ID_EXHAUSTED;
         return { result, valid };
     }
 
@@ -1011,13 +1036,13 @@ public:
     {
         T result { };
         assert(task_executor_try_get_task_result_impl(id, &result, sizeof(T)));
-        id = EXHAUSTED_TASK_ID;
+        id = TASK_ID_EXHAUSTED;
         return result;
     }
 
     int get_id() const noexcept { return id; }
 
-    [[nodiscard]] bool is_exhausted() const noexcept { return id == EXHAUSTED_TASK_ID; }
+    [[nodiscard]] bool is_exhausted() const noexcept { return id == TASK_ID_EXHAUSTED; }
 
     bool operator== (int i) const noexcept { return id == i; }
 
