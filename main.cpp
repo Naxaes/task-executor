@@ -2,11 +2,9 @@
 #define TASK_EXECUTOR_ON_RESULT_BUFFER_OVERFLOW   TASK_EXECUTOR_DROP
 #define TASK_EXECUTOR_ON_RESPONSE_BUFFER_OVERFLOW TASK_EXECUTOR_DROP
 //#define TASK_EXECUTOR_LOGGER(...)
+#define MAX_PENDING_RESPONSES_COUNT 8
 #define MAX_RETURN_SIZE 24
 #include "task_executor.h"
-
-#include <vector>
-#include <unordered_map>
 
 
 struct MyThing
@@ -15,30 +13,24 @@ struct MyThing
     int* data;
 };
 
-struct OtherThing
-{
-    int  size;
-    int* data;
-};
 
-
-MyThing heavy_task()
+struct MyThing heavy_task()
 {
     int  size = 1024 * 1024;
-    auto data = (int*) malloc(size * sizeof(int));
+    int* data = (int*) malloc(size * sizeof(int));
 
     for (int i = 0; i < size; ++i)
     {
         data[i] = i;
     }
 
-    return { size, data };
+    return (struct MyThing) { size, data };
 }
 
 
-OtherThing varying_task(int size)
+struct MyThing varying_task(int size)
 {
-    auto data = (int*) malloc(size * sizeof(int));
+    int* data = (int*) malloc(size * sizeof(int));
 
     data[0] = 2;
     for (int i = 1; i < size - 1; ++i)
@@ -47,150 +39,101 @@ OtherThing varying_task(int size)
     }
     data[size-1] = 3;
 
-    return { size, data };
+    return (struct MyThing) { size, data };
 }
 
 
-void test_executing_tasks()
+int varying_task_other(int size)
 {
-    printf("-------- TEST: test_executing_tasks --------\n");
-    task_executor::initialize(8);
-
-    std::vector<task_executor::task_result<MyThing>> tasks = {
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-            task_executor::create_task<heavy_task>(),
-    };
-
-    task_executor::wait_for_all(tasks);
-
-    for (auto& task : tasks)
+    int result = 0;
+    for (int i = 0; i < size; ++i)
     {
-        MyThing thing = task.get();
-        assert(thing.size == 1024 * 1024);
-        free(thing.data);
+        result += i;
     }
 
-    task_executor_terminate_and_wait();
+    return result;
 }
 
-void test_poll_tasks()
+double varying_task_other_double(double number)
 {
-    printf("-------- TEST: test_executing_tasks --------\n");
+    double result = 10.0 * number * number;
+    return result;
+}
+
+void no_return_task_other_float(double number)
+{
+
+}
+
+
+#include <unistd.h>
+
+void test_better_interface()
+{
     task_executor::initialize(8);
 
-    std::unordered_map<int, task_executor::task_result<MyThing>> tasks;
-    tasks.reserve(16);
-    for (int i = 0; i < tasks.size(); ++i)
-    {
-        auto task = task_executor::create_task<heavy_task>();
-        tasks[task.get_id()] = task;
-    }
+    const size_t task_to_execute = 1000000;
+    size_t queries = 0;
 
-    int results = tasks.size();
-    while (results != 0)
+    while (queries < task_to_execute || task_executor::tasks_are_remaining())
     {
-        int task_id = poll_result();
-        if (task_id >= 0)
+        task_executor::Response response = task_executor::poll_for_next_result();
+        if (response.has_result())
         {
-            auto it = tasks.find(task_id);
-            auto& task = it->second;
-            MyThing thing = task.get();
-            assert(thing.size == 1024 * 1024);
-            tasks.erase(it);
-            free(thing.data);
-        }
-    }
-
-    task_executor::terminate_and_wait();
-}
-
-void test_executing_and_requesting_tasks_interleaved()
-{
-    printf("-------- TEST: test_executing_tasks --------\n");
-    task_executor::initialize(8);
-
-    int task_count = 1000000;
-
-    int counter = 0;
-
-    int results = 0;
-    int queries = 0;
-
-    std::unordered_map<int, task_executor::task_result<MyThing>>    tasks_1;
-    std::unordered_map<int, task_executor::task_result<OtherThing>> tasks_2;
-    tasks_1.reserve(task_count/2);
-    tasks_2.reserve(task_count/2);
-
-    while (results < task_count - (g_dropped_tasks + g_dropped_responses + g_dropped_results))
-    {
-        int task_id = poll_result();
-        if (task_id >= 0)
-        {
-            auto it = tasks_1.find(task_id);
-            if (it != tasks_1.end())
+            if (response.is_return_type<MyThing>())
             {
-                auto& task = it->second;
-                MyThing thing = task.get();
-                assert(thing.size == 1024 * 1024);
-                assert(thing.data[0] == 0 && thing.data[127] == 127);
-                tasks_1.erase(it);
-                free(thing.data);
+                TASK_EXECUTOR_LOGGER("[Main]: Got result 1\n");
+                auto result = response.get_result<MyThing>();
+                assert(result.data[0] == 2 && result.data[127] == 3);
+                free(result.data);
+            }
+            else if (response.is_return_type<int>())
+            {
+                TASK_EXECUTOR_LOGGER("[Main]: Got result 2\n");
+                auto result = response.get_result<int>();
+                assert(result == 45);
+            }
+            else if (response.is_return_type<double>())
+            {
+                TASK_EXECUTOR_LOGGER("[Main]: Got result 3\n");
+                auto result = response.get_result<double>();
+                double expected = 10.0 * 42.0 * 42.0;
+                assert(-0.001 <= expected - result && expected - result <= 0.001);
             }
             else
             {
-                auto it_2 = tasks_2.find(task_id);
-                auto& task = it_2->second;
-                OtherThing thing = task.get();
-                assert(thing.data[0] == 2 && thing.data[127] == 3);
-                counter += thing.data[0];
-                counter += thing.data[127];
-                tasks_2.erase(it_2);
-                free(thing.data);
+                assert(0);
             }
-
-            results += 1;
         }
-        else if (queries < task_count)
+        else
         {
-            if (queries % 2 == 0)
-            {
-                auto task = task_executor::create_task<heavy_task>();
-                tasks_1[task.get_id()] = task;
-            }
+            if (queries >= task_to_execute)
+                break;
+
+            if (queries % 3 == 0)
+                task_executor::create_task<int, varying_task>(128);
+            else if (queries % 3 == 1)
+                task_executor::create_task<int, varying_task_other>(10);
             else
-            {
-                auto task = task_executor::create_task<int, varying_task>(128);
-                tasks_2[task.get_id()] = task;
-            }
+                task_executor::create_task<double, varying_task_other_double>(42.0);
 
             queries += 1;
         }
     }
 
-    assert(counter == (2 + 3) * (results / 2));
+    while (task_executor::tasks_are_remaining())
+    {
+        task_executor::Response response = task_executor::wait_for_next_task();
+        response.consume_task_result();
+    }
 
+    assert(task_executor::tasks_left() == 0);
     task_executor::terminate_and_wait();
 }
 
 
 
-int main()
+int main(int argc, const char* argv[])
 {
-    test_executing_tasks();
-    test_poll_tasks();
-    test_executing_and_requesting_tasks_interleaved();
+    test_better_interface();
 }
