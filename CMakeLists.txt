@@ -7,4 +7,5 @@ add_executable(task_executor_c main.c)
 
 set(CMAKE_CXX_STANDARD 17)
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-braced-scalar-init")
 add_executable(task_executor_cpp main.cpp)
