@@ -123,7 +123,7 @@ void test_better_interface()
             else if (queries % 3 == 1)
                 create_task_with_arg(varying_task_other, int, b);
             else
-            create_task_with_arg(varying_task_other_double, double, c);
+                create_task_with_arg(varying_task_other_double, double, c);
 
             queries += 1;
         }
